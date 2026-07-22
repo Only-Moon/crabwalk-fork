@@ -12,9 +12,16 @@ import {
   type ConnectChallengePayload,
   createConnectParams,
 } from './protocol'
-import { buildSignedDevice } from './device'
+import {
+  buildSignedDevice,
+  clearStoredDeviceToken,
+  getOrCreateIdentity,
+  loadStoredDeviceToken,
+  saveStoredDeviceToken,
+} from './device'
 
 const DEFAULT_GATEWAY_URL = process.env.CLAWDBOT_URL || 'ws://127.0.0.1:18789'
+const DEFAULT_SCOPES = ['operator.read'] as const
 
 type EventCallback = (event: EventFrame) => void
 export type GatewayAuthState =
@@ -27,6 +34,98 @@ export type GatewayAuthState =
 interface PairingInfo {
   requestId?: string
   message?: string
+}
+
+function normalized(value: unknown): string | undefined {
+  return typeof value === 'string' ? value.trim() || undefined : undefined
+}
+
+function isTrustedLoopback(url: string): boolean {
+  try {
+    const u = new URL(url)
+    return u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '::1'
+  } catch {
+    return false
+  }
+}
+
+/** Inline of openclaw selectGatewayConnectAuth / buildGatewayConnectAuth (operator subset). */
+function selectConnectAuth(params: {
+  envToken?: string
+  storedToken?: string
+  storedScopes?: string[]
+  pendingDeviceTokenRetry?: boolean
+  trustedDeviceTokenRetry?: boolean
+}) {
+  const authToken = normalized(params.envToken)
+  const storedToken = normalized(params.storedToken)
+  const useRetryToken =
+    params.pendingDeviceTokenRetry === true &&
+    Boolean(authToken && storedToken && params.trustedDeviceTokenRetry)
+  // Reference: resolved when retry OR (!(authToken) && stored)
+  const resolvedDeviceToken =
+    useRetryToken || (!authToken && storedToken) ? storedToken : undefined
+  const usingStoredDeviceToken =
+    Boolean(resolvedDeviceToken && storedToken) && resolvedDeviceToken === storedToken
+  const selectedToken = authToken ?? resolvedDeviceToken
+  return {
+    authToken: selectedToken,
+    // buildGatewayConnectAuth: deviceToken = authDeviceToken ?? resolvedDeviceToken
+    // select sets authDeviceToken only on retry; resolved covers stored-as-primary
+    authDeviceToken: (useRetryToken ? storedToken : undefined) ?? resolvedDeviceToken,
+    signatureToken: selectedToken ?? null,
+    usingStoredDeviceToken,
+    /** Stored token is auth.token (no env) — for clear-and-retry path. */
+    usingStoredAsPrimary: Boolean(!authToken && selectedToken && selectedToken === storedToken),
+    storedScopes: params.storedScopes,
+  }
+}
+
+function shouldRetryWithDeviceToken(params: {
+  retryBudgetUsed: boolean
+  currentDeviceToken?: string
+  explicitToken?: string
+  storedToken?: string
+  trustedEndpoint: boolean
+  error?: { code?: string; message?: string; details?: unknown }
+}): boolean {
+  if (
+    params.retryBudgetUsed ||
+    params.currentDeviceToken ||
+    !params.explicitToken ||
+    !params.storedToken ||
+    !params.trustedEndpoint
+  ) {
+    return false
+  }
+  const code = params.error?.code ?? ''
+  const message = (params.error?.message ?? '').toLowerCase()
+  const details = JSON.stringify(params.error?.details ?? '')
+  return (
+    code === 'AUTH_TOKEN_MISMATCH' ||
+    message.includes('auth_token_mismatch') ||
+    message.includes('retry_with_device_token') ||
+    details.includes('retry_with_device_token') ||
+    details.includes('AUTH_TOKEN_MISMATCH')
+  )
+}
+
+function shouldRetryClearStoredToken(params: {
+  retryBudgetUsed: boolean
+  usingStoredAsPrimary: boolean
+  envToken?: string
+  error?: { code?: string; message?: string; details?: unknown }
+}): boolean {
+  if (params.retryBudgetUsed || !params.usingStoredAsPrimary || !params.envToken) return false
+  const code = params.error?.code ?? ''
+  const message = (params.error?.message ?? '').toLowerCase()
+  const details = JSON.stringify(params.error?.details ?? '')
+  return (
+    code === 'AUTH_TOKEN_MISMATCH' ||
+    message.includes('auth_token_mismatch') ||
+    message.includes('retry_with_device_token') ||
+    details.includes('AUTH_TOKEN_MISMATCH')
+  )
 }
 
 export class ClawdbotClient {
@@ -45,6 +144,16 @@ export class ClawdbotClient {
   private _pairingInfo: PairingInfo | null = null
   private _connectPromiseSettled = false
   private readonly debugEnabled = process.env.CRABWALK_DEBUG_OPENCLAW === '1'
+  /** One-shot AUTH_TOKEN_MISMATCH retry within a connect attempt. */
+  private _authRetryUsed = false
+  private _pendingDeviceTokenRetry = false
+  private _lastConnectAuth: {
+    authDeviceToken?: string
+    usingStoredAsPrimary: boolean
+  } | null = null
+  private _connectResolve?: (v: HelloOk) => void
+  private _connectReject?: (e: Error) => void
+  private _connectTimeout?: ReturnType<typeof setTimeout>
 
   constructor(
     private url: string = DEFAULT_GATEWAY_URL,
@@ -69,11 +178,16 @@ export class ClawdbotClient {
 
   async connect(): Promise<HelloOk> {
     if (this._connecting || this._connected) {
-      return { type: 'hello-ok', protocol: 3 } as HelloOk
+      return { type: 'hello-ok', protocol: 4 } as HelloOk
     }
     this._connecting = true
     this._connectPromiseSettled = false
+    this._authRetryUsed = false
+    this._pendingDeviceTokenRetry = false
+    this._lastConnectAuth = null
     return new Promise((resolve, reject) => {
+      this._connectResolve = resolve
+      this._connectReject = reject
       const timeout = setTimeout(() => {
         this._connecting = false
         this.ws?.close()
@@ -82,6 +196,7 @@ export class ClawdbotClient {
           reject(new Error('Connection timeout - is openclaw gateway running?'))
         }
       }, 10000)
+      this._connectTimeout = timeout
 
       try {
         this.ws = new WebSocket(this.url)
@@ -106,7 +221,7 @@ export class ClawdbotClient {
             return
           }
 
-          this.handleMessage(msg, resolve, reject, timeout)
+          this.handleMessage(msg)
         } catch (e) {
           console.error('[openclaw] Failed to parse message:', e)
         }
@@ -155,25 +270,59 @@ export class ClawdbotClient {
       return
     }
 
-    let params = createConnectParams(this.token)
+    const stored = loadStoredDeviceToken()
+    const selected = selectConnectAuth({
+      envToken: this.token,
+      storedToken: stored?.token,
+      storedScopes: stored?.scopes,
+      pendingDeviceTokenRetry: this._pendingDeviceTokenRetry,
+      trustedDeviceTokenRetry: isTrustedLoopback(this.url),
+    })
+
+    const scopes =
+      selected.usingStoredDeviceToken && stored?.scopes?.length
+        ? stored.scopes
+        : [...DEFAULT_SCOPES]
+
+    let params = createConnectParams({
+      token: selected.authToken,
+      deviceToken: selected.authDeviceToken,
+      scopes,
+    })
+
+    // Payload platform must match client.platform after normalize (createConnectParams sets raw platform)
     try {
       const device = buildSignedDevice({
         challenge,
-        token: this.token ?? null,
+        token: selected.signatureToken,
         role: params.role,
         scopes: params.scopes,
         clientId: params.client.id,
         clientMode: params.client.mode,
+        platform: params.client.platform,
       })
-      params = createConnectParams(this.token, device)
+      params = createConnectParams({
+        token: selected.authToken,
+        deviceToken: selected.authDeviceToken,
+        scopes,
+        device,
+      })
     } catch (error) {
       console.error('[openclaw] Failed to create signed device identity:', error)
     }
 
+    this._lastConnectAuth = {
+      authDeviceToken: selected.authDeviceToken,
+      usingStoredAsPrimary: selected.usingStoredAsPrimary,
+    }
+
     this.debugLog('sending connect', {
       hasToken: Boolean(params.auth?.token),
+      hasDeviceToken: Boolean(params.auth?.deviceToken),
       hasDevice: Boolean(params.device),
       deviceId: params.device?.id,
+      usingStored: selected.usingStoredDeviceToken,
+      pendingRetry: this._pendingDeviceTokenRetry,
       clientMode: params.client.mode,
       clientPlatform: params.client.platform,
       scopes: params.scopes,
@@ -189,32 +338,149 @@ export class ClawdbotClient {
     this.ws.send(JSON.stringify(response))
   }
 
-  private handleMessage(
-    msg: GatewayFrame | HelloOk,
-    connectResolve?: (v: HelloOk) => void,
-    _connectReject?: (e: Error) => void,
-    connectTimeout?: ReturnType<typeof setTimeout>
-  ) {
+  private handleConnectFailure(error?: { code?: string; message?: string; details?: unknown }) {
+    const stored = loadStoredDeviceToken()
+    const trusted = isTrustedLoopback(this.url)
+    const last = this._lastConnectAuth
+
+    // Env primary failed → retry once with cached device token
+    if (
+      shouldRetryWithDeviceToken({
+        retryBudgetUsed: this._authRetryUsed,
+        currentDeviceToken: last?.authDeviceToken,
+        explicitToken: this.token,
+        storedToken: stored?.token,
+        trustedEndpoint: trusted,
+        error,
+      })
+    ) {
+      this._authRetryUsed = true
+      this._pendingDeviceTokenRetry = true
+      this.debugLog('AUTH_TOKEN_MISMATCH — retrying with device token')
+      this.reopenForAuthRetry()
+      return
+    }
+
+    // Stored primary failed → clear token file, retry once with env token only
+    if (
+      shouldRetryClearStoredToken({
+        retryBudgetUsed: this._authRetryUsed,
+        usingStoredAsPrimary: Boolean(last?.usingStoredAsPrimary),
+        envToken: this.token,
+        error,
+      })
+    ) {
+      this._authRetryUsed = true
+      this._pendingDeviceTokenRetry = false
+      clearStoredDeviceToken()
+      this.debugLog('AUTH_TOKEN_MISMATCH — cleared stored device token, retrying with env')
+      this.reopenForAuthRetry()
+      return
+    }
+
+    const message = error?.message || 'Connect failed'
+    this.updateAuthStateFromError(message)
+    if (this._connectTimeout) clearTimeout(this._connectTimeout)
+    this._connecting = false
+    if (!this._connectPromiseSettled) {
+      this._connectPromiseSettled = true
+      this._connectReject?.(new Error(message))
+    }
+  }
+
+  /** Re-open socket for one-shot auth retry without settling the outer connect promise. */
+  private reopenForAuthRetry() {
+    // Detach old socket so its close handler cannot reject the connect promise.
+    const old = this.ws
+    this.ws = null
+    if (old) {
+      old.removeAllListeners()
+      old.on('error', () => {})
+      try {
+        old.close()
+      } catch {
+        // ignore
+      }
+    }
+
+    this._connected = false
+    try {
+      this.ws = new WebSocket(this.url)
+    } catch (e) {
+      this._connecting = false
+      if (!this._connectPromiseSettled) {
+        this._connectPromiseSettled = true
+        this._connectReject?.(new Error(`Failed to create WebSocket for auth retry: ${e}`))
+      }
+      return
+    }
+
+    this.ws.once('open', () => {
+      this.debugLog('auth-retry socket open, waiting for connect.challenge')
+    })
+
+    this.ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'event' && msg.event === 'connect.challenge') {
+          this.handleChallenge(msg.payload as ConnectChallengePayload)
+          return
+        }
+        this.handleMessage(msg)
+      } catch (e) {
+        console.error('[openclaw] Failed to parse message:', e)
+      }
+    })
+
+    this.ws.on('error', (err) => {
+      this.debugLog('auth-retry socket error', err)
+      if (!this._connectPromiseSettled) {
+        this._connectPromiseSettled = true
+        this._connecting = false
+        this._connectReject?.(err instanceof Error ? err : new Error(String(err)))
+      }
+    })
+
+    this.ws.on('close', (code, reason) => {
+      this.debugLog('auth-retry socket close', {
+        code,
+        reason: reason?.toString?.() ?? '',
+      })
+      if (this._connecting && !this._connectPromiseSettled && !this._connected) {
+        this._connectPromiseSettled = true
+        this._connecting = false
+        this._connectReject?.(
+          new Error(
+            `Gateway closed during auth retry (code ${code}${reason ? `, reason: ${reason.toString()}` : ''})`
+          )
+        )
+      }
+    })
+  }
+
+  private handleMessage(msg: GatewayFrame | HelloOk) {
     if ('type' in msg) {
       switch (msg.type) {
         case 'hello-ok':
-          if (connectTimeout) clearTimeout(connectTimeout)
+          if (this._connectTimeout) clearTimeout(this._connectTimeout)
           this.updateAuthStateFromHello(msg)
           this._connected = true
           this._connecting = false
           this._connectPromiseSettled = true
-          connectResolve?.(msg)
+          this._connectResolve?.(msg)
           break
 
         case 'res':
           // Check if this is the hello-ok response to our connect request
           if (msg.ok && (msg.payload as HelloOk)?.type === 'hello-ok') {
-            if (connectTimeout) clearTimeout(connectTimeout)
+            if (this._connectTimeout) clearTimeout(this._connectTimeout)
             this.updateAuthStateFromHello(msg.payload as HelloOk)
             this._connected = true
             this._connecting = false
             this._connectPromiseSettled = true
-            connectResolve?.(msg.payload as HelloOk)
+            this._connectResolve?.(msg.payload as HelloOk)
+          } else if (!msg.ok && String(msg.id).startsWith('connect-')) {
+            this.handleConnectFailure(msg.error)
           } else {
             this.handleResponse(msg)
           }
@@ -332,6 +598,18 @@ export class ClawdbotClient {
   private updateAuthStateFromHello(hello: HelloOk) {
     const scopes = hello.auth?.scopes
     this._scopes = scopes ? [...scopes] : []
+
+    if (hello.auth?.deviceToken) {
+      const identity = getOrCreateIdentity()
+      saveStoredDeviceToken({
+        deviceId: identity.id,
+        token: hello.auth.deviceToken,
+        role: hello.auth.role,
+        scopes: hello.auth.scopes,
+        updatedAtMs: Date.now(),
+      })
+      this.debugLog('persisted device token')
+    }
 
     if (!scopes) {
       this._authState = 'authorized'

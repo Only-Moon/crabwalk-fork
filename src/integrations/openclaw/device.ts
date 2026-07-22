@@ -10,6 +10,7 @@ import type { ConnectChallengePayload, ConnectDevice } from './protocol'
 
 const DATA_DIR = path.join(process.cwd(), 'data')
 const DEVICE_IDENTITY_FILE = path.join(DATA_DIR, 'device-identity.json')
+const DEVICE_TOKEN_FILE = path.join(DATA_DIR, 'device-token.json')
 
 interface StoredDeviceIdentity {
   id: string
@@ -17,6 +18,14 @@ interface StoredDeviceIdentity {
   privateKeyPem: string
   createdAt: number
   lastUsedAt: number
+}
+
+export interface StoredDeviceToken {
+  deviceId: string
+  token: string
+  role?: string
+  scopes?: string[]
+  updatedAtMs: number
 }
 
 function base64UrlToBuffer(value: string): Buffer {
@@ -76,7 +85,12 @@ function loadStoredIdentity(): StoredDeviceIdentity | null {
 
 function saveStoredIdentity(identity: StoredDeviceIdentity) {
   ensureDataDir()
-  fs.writeFileSync(DEVICE_IDENTITY_FILE, JSON.stringify(identity, null, 2))
+  fs.writeFileSync(DEVICE_IDENTITY_FILE, JSON.stringify(identity, null, 2), { mode: 0o600 })
+  try {
+    fs.chmodSync(DEVICE_IDENTITY_FILE, 0o600)
+  } catch {
+    // ponytail: chmod best-effort on platforms that ignore mode
+  }
 }
 
 function generateStoredIdentity(): StoredDeviceIdentity {
@@ -99,31 +113,36 @@ function generateStoredIdentity(): StoredDeviceIdentity {
   }
 }
 
-interface BuildSignedDeviceParams {
-  challenge: ConnectChallengePayload
-  token: string | null
-  role: string
-  scopes: string[]
-  clientId: string
-  clientMode: string
+/** Verbatim from openclaw gateway-client device-auth.ts */
+export function normalizeDeviceMetadataForAuth(value?: string | null): string {
+  if (typeof value !== 'string') {
+    return ''
+  }
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return ''
+  }
+  return trimmed.replace(/[A-Z]/g, (char) => String.fromCharCode(char.charCodeAt(0) + 32))
 }
 
-function buildDeviceAuthPayload(params: {
+export function buildDeviceAuthPayloadV3(params: {
   deviceId: string
   clientId: string
   clientMode: string
   role: string
   scopes: string[]
   signedAtMs: number
-  token: string | null
-  nonce?: string
-  version?: 'v1' | 'v2'
+  token?: string | null
+  nonce: string
+  platform?: string | null
+  deviceFamily?: string | null
 }): string {
-  const version = params.version ?? (params.nonce ? 'v2' : 'v1')
   const scopes = params.scopes.join(',')
   const token = params.token ?? ''
-  const parts = [
-    version,
+  const platform = normalizeDeviceMetadataForAuth(params.platform)
+  const deviceFamily = normalizeDeviceMetadataForAuth(params.deviceFamily)
+  return [
+    'v3',
     params.deviceId,
     params.clientId,
     params.clientMode,
@@ -131,11 +150,21 @@ function buildDeviceAuthPayload(params: {
     scopes,
     String(params.signedAtMs),
     token,
-  ]
-  if (version === 'v2') {
-    parts.push(params.nonce ?? '')
-  }
-  return parts.join('|')
+    params.nonce,
+    platform,
+    deviceFamily,
+  ].join('|')
+}
+
+interface BuildSignedDeviceParams {
+  challenge: ConnectChallengePayload
+  token: string | null
+  role: string
+  scopes: string[]
+  clientId: string
+  clientMode: string
+  platform?: string | null
+  deviceFamily?: string | null
 }
 
 export function getOrCreateIdentity(): StoredDeviceIdentity {
@@ -149,10 +178,15 @@ export function getOrCreateIdentity(): StoredDeviceIdentity {
 }
 
 export function buildSignedDevice(params: BuildSignedDeviceParams): ConnectDevice {
+  const nonce = params.challenge.nonce?.trim()
+  if (!nonce) {
+    throw new Error('connect.challenge nonce is empty — refusing to sign (would fall back to v1)')
+  }
+
   const identity = getOrCreateIdentity()
   const privateKey = createPrivateKey(identity.privateKeyPem)
   const signedAt = Date.now()
-  const payload = buildDeviceAuthPayload({
+  const payload = buildDeviceAuthPayloadV3({
     deviceId: identity.id,
     clientId: params.clientId,
     clientMode: params.clientMode,
@@ -160,7 +194,9 @@ export function buildSignedDevice(params: BuildSignedDeviceParams): ConnectDevic
     scopes: params.scopes,
     signedAtMs: signedAt,
     token: params.token,
-    nonce: params.challenge.nonce || undefined,
+    nonce,
+    platform: params.platform,
+    deviceFamily: params.deviceFamily ?? '',
   })
   const signature = base64UrlEncode(sign(null, Buffer.from(payload, 'utf8'), privateKey))
 
@@ -172,6 +208,35 @@ export function buildSignedDevice(params: BuildSignedDeviceParams): ConnectDevic
     publicKey: identity.publicKey,
     signature,
     signedAt,
-    nonce: params.challenge.nonce,
+    nonce,
+  }
+}
+
+export function loadStoredDeviceToken(): StoredDeviceToken | null {
+  try {
+    if (!fs.existsSync(DEVICE_TOKEN_FILE)) return null
+    const data = JSON.parse(fs.readFileSync(DEVICE_TOKEN_FILE, 'utf-8')) as StoredDeviceToken
+    if (!data.token || !data.deviceId) return null
+    return data
+  } catch {
+    return null
+  }
+}
+
+export function saveStoredDeviceToken(entry: StoredDeviceToken) {
+  ensureDataDir()
+  fs.writeFileSync(DEVICE_TOKEN_FILE, JSON.stringify(entry, null, 2), { mode: 0o600 })
+  try {
+    fs.chmodSync(DEVICE_TOKEN_FILE, 0o600)
+  } catch {
+    // ponytail: chmod best-effort
+  }
+}
+
+export function clearStoredDeviceToken() {
+  try {
+    if (fs.existsSync(DEVICE_TOKEN_FILE)) fs.unlinkSync(DEVICE_TOKEN_FILE)
+  } catch {
+    // ignore
   }
 }

@@ -1,4 +1,4 @@
-// Clawdbot Gateway Protocol v3 types
+// Clawdbot Gateway Protocol v4 types
 
 // Frame types
 export interface RequestFrame {
@@ -13,7 +13,7 @@ export interface ResponseFrame {
   id: string
   ok: boolean
   payload?: unknown
-  error?: { code: string; message: string }
+  error?: { code: string; message: string; details?: unknown }
 }
 
 export interface EventFrame {
@@ -36,10 +36,10 @@ export interface ClientInfo {
 }
 
 export interface ConnectParams {
-  minProtocol: 3
-  maxProtocol: 3
+  minProtocol: 3 | 4
+  maxProtocol: 3 | 4
   client: ClientInfo
-  auth?: { token?: string }
+  auth?: { token?: string; deviceToken?: string }
   device?: ConnectDevice
 }
 
@@ -59,6 +59,7 @@ export interface ConnectDevice {
 export interface HelloAuth {
   role?: string
   scopes?: string[]
+  deviceToken?: string
 }
 
 export interface HelloOk {
@@ -79,14 +80,15 @@ export interface PresenceEntry {
   connectedAt: number
 }
 
-// Chat events
-// Note: gateway sends cumulative message content with each delta, not incremental chars
+// Chat events — v4 may send deltaText (incremental) and/or cumulative message
 export interface ChatEvent {
   runId: string
   sessionKey: string
   seq: number
   state: 'delta' | 'final' | 'aborted' | 'error'
   message?: unknown
+  deltaText?: string
+  replace?: boolean
   errorMessage?: string
   usage?: {
     inputTokens?: number
@@ -251,8 +253,15 @@ export function parseSessionKey(key: string): {
   return { agentId, platform, recipient, isGroup }
 }
 
+export type CreateConnectOptions = {
+  token?: string
+  deviceToken?: string
+  device?: ConnectDevice
+  scopes?: string[]
+}
+
 export function createConnectParams(
-  token?: string,
+  tokenOrOpts?: string | CreateConnectOptions,
   device?: ConnectDevice
 ): ConnectParams & {
   role: string
@@ -263,6 +272,12 @@ export function createConnectParams(
   locale: string
   userAgent: string
 } {
+  // ponytail: overload keeps call sites short; prefer opts object for deviceToken/scopes
+  const opts: CreateConnectOptions =
+    typeof tokenOrOpts === 'string' || tokenOrOpts === undefined
+      ? { token: tokenOrOpts, device }
+      : tokenOrOpts
+
   const platformMap: Record<string, string> = {
     win32: 'windows',
     darwin: 'macos',
@@ -270,23 +285,34 @@ export function createConnectParams(
   }
   const platform = platformMap[process.platform] ?? process.platform
 
+  const authToken = opts.token
+  const authDeviceToken = opts.deviceToken
+  const auth =
+    authToken || authDeviceToken
+      ? {
+          ...(authToken ? { token: authToken } : {}),
+          ...(authDeviceToken ? { deviceToken: authDeviceToken } : {}),
+        }
+      : undefined
+
   return {
-    minProtocol: 3,
-    maxProtocol: 3,
+    minProtocol: 4,
+    maxProtocol: 4,
     client: {
       id: 'cli',
+      displayName: 'crabwalk-monitor',
       version: '0.1.0',
       platform,
       mode: 'cli',
     },
     role: 'operator',
-    scopes: ['operator.read'],
+    scopes: opts.scopes ?? ['operator.read'],
     caps: [],
     commands: [],
     permissions: {},
     locale: 'en-US',
     userAgent: 'crabwalk-monitor/0.1.0',
-    auth: token ? { token } : undefined,
-    device,
+    auth,
+    device: opts.device,
   }
 }

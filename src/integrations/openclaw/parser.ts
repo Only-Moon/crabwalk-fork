@@ -55,7 +55,13 @@ export function chatEventToAction(event: ChatEvent): MonitorAction {
     }
   }
 
-  if (event.message) {
+  // v4: deltaText when replace===true or message absent; else cumulative message path
+  if (
+    typeof event.deltaText === 'string' &&
+    (event.replace === true || event.message == null)
+  ) {
+    action.content = event.deltaText
+  } else if (event.message) {
     if (typeof event.message === 'string') {
       action.content = event.message
     } else if (typeof event.message === 'object') {
